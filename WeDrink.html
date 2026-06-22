@@ -1696,8 +1696,8 @@ function saveQuickTx(){
 /* dashboard quick receipt scan */
 document.getElementById("dashSalesFile").onchange=async function(ev){
   const f=ev.target.files[0]; ev.target.value=""; if(!f)return;
-  toast("Чек оқылуда...");
-  try{ const text=await ocrRecognize(f,()=>{}); const r=parseSalesReceipt(text); salesReviewModal(r,text); }
+  toast(aiOcrAvailable()?"AI чекті оқуда...":"Чек оқылуда...");
+  try{ const {r,raw}=await ocrSales(f); salesReviewModal(r,raw); }
   catch(e){ toast(e.message||"OCR қатесі"); }
 };
 function dashScanPick(){ document.getElementById("dashSalesFile").click(); }
@@ -1904,6 +1904,91 @@ async function ocrRecognize(file,onProg,langs){
 function num(s){ return parseFloat(String(s).replace(/\s/g,"").replace(",",".")); }
 function todayISO(){ const d=new Date(); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); }
 
+/* ============================================================
+   AI VISION OCR (Gemini сурет оқу) — Supabase proxy не тікелей Gemini.
+   Қолжетімді болса осы қолданылады, болмаса Tesseract-ке көшеді.
+   ============================================================ */
+function aiOcrAvailable(){
+  return (aiCfg.provider==="supabase" && !!aiCfg.proxyUrl) || (aiCfg.provider==="gemini" && !!aiCfg.geminiKey);
+}
+function fileToB64(file){
+  return new Promise((res,rej)=>{
+    const r=new FileReader();
+    r.onload=()=>{ const s=String(r.result); const i=s.indexOf(","); res({data:i>=0?s.slice(i+1):s, mime:file.type||"image/jpeg"}); };
+    r.onerror=()=>rej(new Error("Файл оқылмады"));
+    r.readAsDataURL(file);
+  });
+}
+function parseJsonLoose(t){
+  if(!t) return null;
+  try{ return JSON.parse(t); }catch(e){}
+  const m=t.match(/\{[\s\S]*\}/); if(m){ try{ return JSON.parse(m[0]); }catch(e){} }
+  return null;
+}
+const OCR_PROMPTS={
+  sales:'Бұл — сату чегі (POS). Суреттен оқып, ТЕК осы JSON-ды қайтар (басқа мәтінсіз): {"date":"YYYY-MM-DD","rcpt":"чек нөмірі не \\"\\"","addr":"нүкте/мекенжай коды не \\"\\"","items":[{"name":"атауы","qty":сан,"amount":сома}],"total":жалпы_сома}. Сома теңгемен, бүтін сан.',
+  supply:'Бұл — жабдықтаушының азық-түлік чегі. ТЕК осы JSON-ды қайтар: {"date":"YYYY-MM-DD","items":[{"name":"атауы","qty":сан,"amount":сома}],"total":жалпы_сома}. Сома теңгемен, бүтін сан.',
+  catalog:'Бұл — жабдықтаушы жүкқұжаты (қытайша/орысша аралас болуы мүмкін). Әр тауар жолын оқы. ТЕК осы JSON-ды қайтар: {"date":"YYYY-MM-DD","phone":"телефон не \\"\\"","items":[{"name":"атауы (орысша болса орысша қалдыр)","spec":"спец. мыс. 3KG×8","qty":сан,"price":бірлік_баға,"amount":сома}]}. Сома мен баға теңгемен, бүтін сан.'
+};
+async function aiVisionExtract(file,kind){
+  const {data,mime}=await fileToB64(file);
+  const sys="Сен — чек пен жүкқұжат оқитын дәл OCR көмекшісісің. Әрқашан тек жарамды JSON қайтарасың, ешқандай қосымша мәтін жазбайсың.";
+  const prompt=OCR_PROMPTS[kind]||OCR_PROMPTS.sales;
+  let textOut="";
+  if(aiCfg.provider==="supabase"){
+    const headers={"Content-Type":"application/json"};
+    if(aiCfg.proxyKey){ headers["Authorization"]="Bearer "+aiCfg.proxyKey; headers["apikey"]=aiCfg.proxyKey; }
+    if(aiCfg.proxySecret) headers["x-app-secret"]=aiCfg.proxySecret;
+    const res=await fetch(aiCfg.proxyUrl,{method:"POST",headers,body:JSON.stringify({system:sys,prompt,image:data,mime,json:true})});
+    if(!res.ok){ let d=""; try{d=(await res.json()).error||"";}catch(e){} throw new Error("Сервер "+res.status+(d?": "+d:"")); }
+    textOut=((await res.json()).text||"").trim();
+  } else {
+    const model=aiCfg.geminiModel||"gemini-2.5-flash";
+    const body={system_instruction:{parts:[{text:sys}]},
+      contents:[{role:"user",parts:[{text:prompt},{inline_data:{mime_type:mime,data}}]}],
+      generationConfig:{temperature:0.1,maxOutputTokens:2048,responseMimeType:"application/json"}};
+    const res=await fetch("https://generativelanguage.googleapis.com/v1beta/models/"+encodeURIComponent(model)+":generateContent?key="+encodeURIComponent(aiCfg.geminiKey),
+      {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    if(!res.ok){ let d=""; try{d=(await res.json()).error?.message||"";}catch(e){} throw new Error("Gemini "+res.status+(d?": "+d:"")); }
+    const dt=await res.json();
+    const parts=(dt.candidates&&dt.candidates[0]&&dt.candidates[0].content&&dt.candidates[0].content.parts)||[];
+    textOut=parts.map(p=>p.text||"").join("").trim();
+  }
+  return {obj:parseJsonLoose(textOut),raw:textOut};
+}
+function salesObjFromAI(o){
+  o=o||{};
+  let cafeId=null,matchedAddr=null;
+  if(o.addr){ for(const c of data.cafes){ if(c.addr && String(o.addr).includes(c.addr)){ cafeId=c.id; matchedAddr=c.addr; break; } } }
+  const items=(o.items||[]).map(it=>({name:(it.name||"Тауар"),qty:+it.qty||1,amount:+it.amount||0}));
+  let total=+o.total||0; if(!total) total=items.reduce((a,x)=>a+x.amount,0);
+  return {cafeId,matchedAddr,date:o.date||todayISO(),rcpt:String(o.rcpt||""),items,total};
+}
+function supplyObjFromAI(o){
+  o=o||{};
+  const items=(o.items||[]).map(it=>({name:(it.name||"Тауар"),qty:+it.qty||1,amount:+it.amount||0}));
+  let total=+o.total||0; if(!total) total=items.reduce((a,x)=>a+x.amount,0);
+  return {date:o.date||todayISO(),items,total};
+}
+function catalogObjFromAI(o){
+  o=o||{};
+  const items=(o.items||[]).map(it=>({name:(it.name||"Тауар"),spec:it.spec||"",unit:"дана",qty:+it.qty||1,price:+it.price||0,amount:(+it.amount|| ((+it.qty||0)*(+it.price||0)) )}));
+  return {date:o.date||todayISO(),phone:String(o.phone||""),items};
+}
+/* Біріккен оқу: AI болса AI, әйтпесе/қате болса Tesseract */
+async function ocrSales(file,onProg){
+  if(aiOcrAvailable()){ try{ const {obj,raw}=await aiVisionExtract(file,"sales"); return {r:salesObjFromAI(obj),raw}; }catch(e){ toast("AI оқу сәтсіз — Tesseract-пен оқимыз"); } }
+  const text=await ocrRecognize(file,onProg||(()=>{}),"rus"); return {r:parseSalesReceipt(text),raw:text};
+}
+async function ocrSupply(file,onProg){
+  if(aiOcrAvailable()){ try{ const {obj,raw}=await aiVisionExtract(file,"supply"); return {r:supplyObjFromAI(obj),raw}; }catch(e){ toast("AI оқу сәтсіз — Tesseract-пен оқимыз"); } }
+  const text=await ocrRecognize(file,onProg||(()=>{}),"rus"); return {r:parseSupplyReceipt(text),raw:text};
+}
+async function ocrCatalog(file,onProg){
+  if(aiOcrAvailable()){ try{ const {obj,raw}=await aiVisionExtract(file,"catalog"); return {r:catalogObjFromAI(obj),raw}; }catch(e){ toast("AI оқу сәтсіз — Tesseract-пен оқимыз"); } }
+  const text=await ocrRecognize(file,onProg||(()=>{}),"rus+chi_sim"); return {r:parseCatalogInvoice(text),raw:text};
+}
+
 /* ---- Sales receipt parser (uniform POS format) ---- */
 function parseSalesReceipt(text){
   const lines=text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
@@ -2015,13 +2100,12 @@ function hideProg(boxId){ const b=document.getElementById(boxId); if(b)b.classLi
 async function handleSalesOcr(ev,cafeId){
   const f=ev.target.files[0]; ev.target.value=""; if(!f)return;
   const pid="prog_"+cafeId;
-  setProg(pid,0.05,"Дайындалуда");
+  setProg(pid,0.05,aiOcrAvailable()?"AI оқуда":"Дайындалуда");
   try{
-    const text=await ocrRecognize(f,(p,l)=>setProg(pid,p,l));
+    const {r,raw}=await ocrSales(f,(p,l)=>setProg(pid,p,l));
     hideProg(pid);
-    const r=parseSalesReceipt(text);
     if(!r.cafeId) r.cafeId=cafeId; // fallback to the card's cafe
-    salesReviewModal(r,text);
+    salesReviewModal(r,raw);
   }catch(e){ hideProg(pid); toast(e.message||"OCR қатесі"); }
 }
 
@@ -2202,11 +2286,10 @@ function stockOcrPick(mode){ document.getElementById(mode==="camera"?"stockOcrCa
 let _stockProgToast=null;
 async function handleStockOcr(ev){
   const f=ev.target.files[0]; ev.target.value=""; if(!f)return;
-  toast("Чек оқылуда...");
+  toast(aiOcrAvailable()?"AI чекті оқуда...":"Чек оқылуда...");
   try{
-    const text=await ocrRecognize(f,(p,l)=>{ if(p>=0.99)toast("Талдау..."); });
-    const r=parseSupplyReceipt(text);
-    supplyReviewModal(r,text);
+    const {r,raw}=await ocrSupply(f,(p,l)=>{ if(p>=0.99)toast("Талдау..."); });
+    supplyReviewModal(r,raw);
   }catch(e){ toast(e.message||"OCR қатесі"); }
 }
 function supplyReviewModal(r,rawText){
@@ -2412,11 +2495,10 @@ document.getElementById("catOcrCam").onchange=e=>handleCatOcr(e);
 document.getElementById("catOcrFile").onchange=e=>handleCatOcr(e);
 async function handleCatOcr(ev){
   const f=ev.target.files[0]; ev.target.value=""; if(!f)return;
-  toast("Жүкқұжат оқылуда... қытай+орыс тілдері жүктелуде, біршама уақыт алады");
+  toast(aiOcrAvailable()?"AI жүкқұжатты оқуда...":"Жүкқұжат оқылуда... (қытай+орыс, біршама уақыт алады)");
   try{
-    const text=await ocrRecognize(f,()=>{},"rus+chi_sim");
-    const r=parseCatalogInvoice(text);
-    catalogReviewModal(r,text);
+    const {r,raw}=await ocrCatalog(f);
+    catalogReviewModal(r,raw);
   }catch(e){ toast(e.message||"OCR қатесі"); }
 }
 function catalogReviewModal(r,rawText){
@@ -2823,14 +2905,14 @@ document.getElementById("en_supCam").onchange=e=>entryHandleSup(e);
 document.getElementById("en_supFile").onchange=e=>entryHandleSup(e);
 async function entryHandleSales(ev){
   const f=ev.target.files[0]; ev.target.value=""; if(!f)return;
-  toast("Чек оқылуда...");
-  try{ const text=await ocrRecognize(f,()=>{}); const r=parseSalesReceipt(text); salesReviewModal(r,text); }
+  toast(aiOcrAvailable()?"AI чекті оқуда...":"Чек оқылуда...");
+  try{ const {r,raw}=await ocrSales(f); salesReviewModal(r,raw); }
   catch(e){ toast(e.message||"OCR қатесі"); }
 }
 async function entryHandleSup(ev){
   const f=ev.target.files[0]; ev.target.value=""; if(!f)return;
-  toast("Чек оқылуда...");
-  try{ const text=await ocrRecognize(f,()=>{}); const r=parseSupplyReceipt(text); supplyReviewModal(r,text); }
+  toast(aiOcrAvailable()?"AI чекті оқуда...":"Чек оқылуда...");
+  try{ const {r,raw}=await ocrSupply(f); supplyReviewModal(r,raw); }
   catch(e){ toast(e.message||"OCR қатесі"); }
 }
 
