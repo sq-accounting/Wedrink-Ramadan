@@ -2,8 +2,18 @@
 <html lang="kk">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>WeDrink · Басқару панелі · Түркістан</title>
+<meta name="description" content="WeDrink кафе желісінің басқару панелі — қаржы, қойма, кадр, CRM, OCR, AI көмекші">
+<!-- PWA / мобильді қосымша -->
+<meta name="theme-color" content="#FAF6EE">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="WeDrink">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -426,6 +436,20 @@
     .month input{width:118px}
   }
 
+  /* ---------- PWA: notch / home-indicator қауіпсіз аймағы ---------- */
+  .mobile-bar{padding-bottom:calc(8px + env(safe-area-inset-bottom,0px))}
+  @media (max-width:900px){
+    .topbar{padding-top:calc(13px + env(safe-area-inset-top,0px))}
+    /* iOS: 16px-тен кіші өрістерде фокуста автоматты зумды болдырмау */
+    .field input,.field select,.filters input,.filters select,.search input,
+    .ai-input textarea,.auth-field input,.rev-line input,.stock-pick input,
+    .stock-pick select,.cat-rev input,.cat-rev select,input[type=month]{font-size:16px}
+  }
+  /* Standalone (орнатылған) режимде мәтін таңдалуын азайтып, app-сезім беру */
+  @media (display-mode:standalone){
+    body{-webkit-tap-highlight-color:transparent}
+  }
+
   /* ---------- Print: monthly report → PDF ---------- */
   #printArea{display:none}
   @media print{
@@ -556,6 +580,7 @@
       <div class="page-sub" id="pageSub">Екі кафенің жалпы көрсеткіштері</div>
     </div>
     <div class="topbar-controls">
+      <button class="btn btn-sugar btn-sm hide" id="installBtn" onclick="pwaInstall()" title="Қосымшаны орнату"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>Орнату</button>
       <button class="sync-chip hide" id="syncChip" onclick="syncNow(true)" title="Қазір синхрондау"><span class="sdot"></span><span id="syncChipTxt">Синхрондау</span></button>
       <div class="seg" id="cafeSeg"></div>
       <div class="month">
@@ -3009,6 +3034,28 @@ function aiApplyAction(i){
   aiMsgs.forEach((m,j)=>m.i=j);
   renderAI();
   toast("Операция қосылды");
+}
+
+/* ============================================================
+   PWA: орнату ұсынысы + service worker (офлайн жұмыс)
+   ============================================================ */
+let _deferredPrompt=null;
+function isStandalone(){ return window.matchMedia("(display-mode:standalone)").matches || window.navigator.standalone===true; }
+function showInstallBtn(show){ const b=document.getElementById("installBtn"); if(b)b.classList.toggle("hide",!show); }
+window.addEventListener("beforeinstallprompt",e=>{ e.preventDefault(); _deferredPrompt=e; if(!isStandalone())showInstallBtn(true); });
+window.addEventListener("appinstalled",()=>{ _deferredPrompt=null; showInstallBtn(false); toast("Қосымша орнатылды ✓"); });
+function pwaInstall(){
+  if(_deferredPrompt){
+    _deferredPrompt.prompt();
+    _deferredPrompt.userChoice.finally(()=>{ _deferredPrompt=null; showInstallBtn(false); });
+  } else {
+    // iOS Safari beforeinstallprompt-ты қолдамайды — қолмен нұсқау
+    const ios=/iphone|ipad|ipod/i.test(navigator.userAgent);
+    toast(ios?"Орнату: Бөлісу → «Негізгі экранға қосу»":"Браузер мәзірінен «Қосымшаны орнату» таңдаңыз");
+  }
+}
+if("serviceWorker" in navigator && location.protocol.startsWith("http")){
+  window.addEventListener("load",()=>{ navigator.serviceWorker.register("./sw.js").catch(()=>{}); });
 }
 
 /* ============== INIT ============== */
